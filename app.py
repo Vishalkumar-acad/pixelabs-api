@@ -1,4 +1,5 @@
 import io
+import re
 import os
 import shutil
 import subprocess
@@ -435,3 +436,212 @@ async def images_to_pdf(
         media_type="application/pdf",
         headers=hdr(0, out_bytes, False, {"X-Page-Count": str(len(writer.pages))}),
     )
+
+# ---------------- Media: audio & video (ffmpeg) ----------------
+
+FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
+AUDIO_EXT = {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", ".wma", ".amr", ".aiff"}
+VIDEO_EXT = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".3gp", ".ts"}
+MP3_MIME = "audio/mpeg"
+
+
+def _ext(name: str, allowed: set) -> str:
+    e = os.path.splitext((name or "").lower())[1]
+    if e not in allowed:
+        raise HTTPException(400, f"unsupported file type '{e or '(none)'}'")
+    return e
+
+
+def run_ffmpeg(args, timeout=TIMEOUT_SECS):
+    try:
+        p = subprocess.run([FFMPEG] + args, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise HTTPException(503, "ffmpeg not installed")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "processing timed out — try a shorter clip")
+    if p.returncode != 0:
+        tail = p.stderr.decode("utf-8", "ignore")[-300:]
+        raise HTTPException(400, "ffmpeg failed: " + tail.replace("\n", " "))
+    return p.stdout
+
+
+def probe_sample_rate(path: str) -> int:
+    try:
+        p = subprocess.run([FFMPEG, "-i", path], capture_output=True, timeout=30)
+        text = p.stderr.decode("utf-8", "ignore")
+        m = re.search(r"(\d{4,6}) Hz", text)
+        return int(m.group(1)) if m else 44100
+    except Exception:
+        return 44100
+
+
+def mp3_response(out: bytes, orig_len: int, extra=None):
+    h = {
+        "X-Original-Size": str(orig_len),
+        "X-Result-Size": str(len(out)),
+        "X-Kept": "0",
+        "Cache-Control": "no-store",
+    }
+    if extra:
+        h.update(extra)
+    return Response(content=out, media_type=MP3_MIME, headers=h)
+
+
+@app.post("/audio/trim")
+async def audio_trim(
+    file: UploadFile = File(...),
+    start: float = Form(0),
+    end: float = Form(-1),
+    format: str = Form("mp3"),
+):
+    data = await file.read()
+    check_file(file, data)
+    _ext(file.filename, AUDIO_EXT)
+    fmt = "mp3" if format != "wav" else "wav"
+    start = max(0.0, float(start))
+    if end < 0 or end <= start:
+        raise HTTPException(400, "end must be greater than start")
+    if end - start > 1800:
+        raise HTTPException(400, "clip too long (max 30 minutes)")
+    duration = min(end - start, 1800)
+
+    with tempfile.NamedTemporaryFile(suffix=_ext(file.filename, AUDIO_EXT), delete=False) as t:
+        t.write(data)
+        path = t.name
+    try:
+        if fmt == "wav":
+            out = run_ffmpeg([
+                "-hide_banner", "-loglevel", "error",
+                "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                "-i", path, "-c:a", "pcm_s16le", "-f", "wav", "-",
+            ])
+            return Response(
+                content=out, media_type="audio/wav",
+                headers={"X-Original-Size": str(len(data)), "X-Result-Size": str(len(out)),
+                         "X-Kept": "0", "X-Format": "wav", "Cache-Control": "no-store"})
+        out = run_ffmpeg([
+            "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+            "-i", path, "-c:a", "libmp3lame", "-b:a", "160k", "-f", "mp3", "-",
+        ])
+        return mp3_response(out, len(data), {"X-Format": "mp3"})
+    finally:
+        os.unlink(path)
+
+
+@app.post("/audio/speed")
+async def audio_speed(
+    file: UploadFile = File(...),
+    factor: float = Form(1.0),
+    mode: str = Form("speed"),
+    format: str = Form("mp3"),
+):
+    data = await file.read()
+    check_file(file, data)
+    _ext(file.filename, AUDIO_EXT)
+    factor = float(factor)
+    if factor < 0.25 or factor > 4.0:
+        raise HTTPException(400, "factor must be between 0.25 and 4")
+
+    with tempfile.NamedTemporaryFile(suffix=_ext(file.filename, AUDIO_EXT), delete=False) as t:
+        t.write(data)
+        path = t.name
+    try:
+        sr = probe_sample_rate(path)
+        # tape style: asetrate changes pitch+speed together (cassette player)
+        out = run_ffmpeg([
+            "-hide_banner", "-loglevel", "error",
+            "-i", path,
+            "-af", f"asetrate={int(sr * factor)},aresample={sr}",
+            "-c:a", "libmp3lame", "-b:a", "160k", "-f", "mp3", "-",
+        ])
+        return mp3_response(out, len(data), {"X-Format": "mp3"})
+    finally:
+        os.unlink(path)
+
+
+@app.post("/audio/join")
+async def audio_join(
+    files: list[UploadFile] = File(...),
+    gap: float = Form(0),
+):
+    if not files:
+        raise HTTPException(400, "no files provided")
+    if len(files) > MAX_FILES:
+        raise HTTPException(400, f"too many files (max {MAX_FILES})")
+    gap = max(0.0, min(float(gap), 10.0))
+
+    total_in = 0
+    tmpdir = tempfile.mkdtemp()
+    try:
+        parts = []
+        for i, f in enumerate(files):
+            d = await f.read()
+            check_file(f, d)
+            total_in += len(d)
+            ext = _ext(f.filename, AUDIO_EXT)
+            src = os.path.join(tmpdir, f"in{i}{ext}")
+            with open(src, "wb") as fh:
+                fh.write(d)
+            part = os.path.join(tmpdir, f"p{i}.wav")
+            run_ffmpeg(["-hide_banner", "-loglevel", "error", "-i", src,
+                        "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", part])
+            parts.append(part)
+            if gap > 0 and i < len(files) - 1:
+                sil = os.path.join(tmpdir, f"s{i}.wav")
+                run_ffmpeg(["-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                            "-t", f"{gap:.2f}", "-c:a", "pcm_s16le", sil])
+                parts.append(sil)
+
+        with open(os.path.join(tmpdir, "list.txt"), "w") as lf:
+            for p in parts:
+                lf.write(f"file '{p}'\n")
+
+        out = run_ffmpeg([
+            "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", os.path.join(tmpdir, "list.txt"),
+            "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "-",
+        ])
+        return mp3_response(out, total_in, {"X-Format": "mp3"})
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.post("/video/gif")
+async def video_gif(
+    file: UploadFile = File(...),
+    start: float = Form(0),
+    end: float = Form(-1),
+    width: int = Form(320),
+    fps: int = Form(10),
+):
+    data = await file.read()
+    check_file(file, data)
+    _ext(file.filename, VIDEO_EXT)
+    start = max(0.0, float(start))
+    if end < 0 or end <= start:
+        raise HTTPException(400, "end must be greater than start")
+    duration = min(end - start, 30.0)
+    width = max(120, min(int(width), 1280))
+    fps = max(3, min(int(fps), 20))
+
+    with tempfile.NamedTemporaryFile(suffix=_ext(file.filename, VIDEO_EXT), delete=False) as t:
+        t.write(data)
+        path = t.name
+    try:
+        vf = (f"fps={fps},scale={width}:-2:flags=lanczos,"
+              "split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer")
+        out = run_ffmpeg([
+            "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+            "-i", path,
+            "-vf", vf, "-loop", "0", "-f", "gif", "-",
+        ])
+        return Response(
+            content=out, media_type="image/gif",
+            headers={"X-Original-Size": str(len(data)), "X-Result-Size": str(len(out)),
+                     "X-Kept": "0", "X-Format": "gif", "Cache-Control": "no-store"},
+        )
+    finally:
+        os.unlink(path)
