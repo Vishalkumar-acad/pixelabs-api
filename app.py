@@ -35,17 +35,15 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=[
         "X-Original-Size", "X-Result-Size", "X-Kept",
-        "X-Format", "X-Page-Count", "X-Heic",
+        "X-Format", "X-Page-Count", "X-Heic", "X-Resized",
     ],
 )
-
 
 def check_file(upload: UploadFile, data: bytes):
     if not data:
         raise HTTPException(400, "empty file")
     if len(data) > MAX_BYTES:
         raise HTTPException(413, "file too large (max 50 MB)")
-
 
 @app.get("/")
 def root():
@@ -67,7 +65,6 @@ def hdr(orig_len: int, out: bytes, kept: bool, extra=None):
     if extra:
         h.update(extra)
     return h
-
 
 # ---------------- PDF: compress (Ghostscript) ----------------
 
@@ -111,13 +108,17 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-
 # ---------------- Image helpers ----------------
 
 def load_image(data: bytes) -> Image.Image:
     try:
         img = Image.open(io.BytesIO(data))
         img.load()
+        # Apply EXIF orientation so phone photos are always upright.
+        # Remember the original format first: exif_transpose() drops it.
+        fmt = img.format
+        img = ImageOps.exif_transpose(img)
+        img.format = fmt
         return img
     except Exception:
         raise HTTPException(400, "unsupported or corrupted image file")
@@ -133,7 +134,7 @@ def save_image(img: Image.Image, fmt: str, quality: int) -> bytes:
             img = bg
         else:
             img = img.convert("RGB")
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
     elif fmt == "png":
         img.save(buf, format="PNG", optimize=True)
     elif fmt == "webp":
@@ -142,7 +143,6 @@ def save_image(img: Image.Image, fmt: str, quality: int) -> bytes:
         raise HTTPException(400, "unsupported target format")
     return buf.getvalue()
 
-
 # ---------------- Image: compress ----------------
 
 @app.post("/image/compress")
@@ -150,49 +150,63 @@ async def compress_image(
     file: UploadFile = File(...),
     level: str = Form("medium"),
     target_kb: int = Form(0),
-    quality: int = Form(0),
-    max_dim: int = Form(0),
-    format: str = Form("jpg"),
 ):
     data = await file.read()
     check_file(file, data)
     img = load_image(data)
-
-    if max_dim and max_dim > 0:
-        w, h = img.size
-        if max(w, h) > max_dim:
-            scale = max_dim / float(max(w, h))
-            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-
-    fmt = (format or "jpg").lower()
-    if fmt == "jpeg":
-        fmt = "jpg"
-    if fmt not in ("jpg", "png", "webp"):
-        fmt = "jpg"
-
-    q = quality if 1 <= quality <= 100 else IMG_QUALITY.get(level, IMG_QUALITY["medium"])
+    did_resize = False
 
     if target_kb and target_kb > 0:
-        # binary-search encoder quality to hit the target size
+        # Smart target-size search. Crushing JPEG quality alone to hit a
+        # small size looks terrible (blocky text, washed-out colors), so
+        # never go below FLOOR quality while the image can still be made
+        # smaller: shrink 15% at a time first. A slightly smaller image
+        # at good quality always beats a full-size image at awful quality.
         target = target_kb * 1024
+        FLOOR = 45
+        MIN_EDGE = 500  # keep text on documents readable
+        w, h = img.size
+        cur = img
         best = None
-        lo, hi = 5, 95
-        for _ in range(7):
-            mid = (lo + hi) // 2
-            out = save_image(img, fmt, mid)
-            if len(out) <= target:
-                best = out
-                lo = mid + 1
-            else:
-                hi = mid - 1
+        while True:
+            if len(save_image(cur, "jpg", FLOOR)) <= target:
+                best = save_image(cur, "jpg", FLOOR)
+                lo, hi = FLOOR, 95
+                for _ in range(7):
+                    mid = (lo + hi) // 2
+                    out = save_image(cur, "jpg", mid)
+                    if len(out) <= target:
+                        best = out
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                break
+            if w <= MIN_EDGE or h <= MIN_EDGE:
+                break
+            w = max(1, round(w * 0.85))
+            h = max(1, round(h * 0.85))
+            cur = img.resize((w, h), Image.LANCZOS)
+            did_resize = True
         if best is None:
-            best = save_image(img, fmt, 5)
+            # already at the readability limit — fall back to quality search
+            lo, hi = 5, 95
+            for _ in range(7):
+                mid = (lo + hi) // 2
+                out = save_image(cur, "jpg", mid)
+                if len(out) <= target:
+                    best = out
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best is None:
+                best = save_image(cur, "jpg", 5)
         out_bytes = best
         kept = len(out_bytes) >= len(data)
         if kept:
             out_bytes = data
     else:
-        out_bytes = save_image(img, fmt, q)
+        q = IMG_QUALITY.get(level, IMG_QUALITY["medium"])
+        out_bytes = save_image(img, "jpg", q)
         if len(out_bytes) >= len(data):
             out_bytes = data
             kept = True
@@ -200,27 +214,23 @@ async def compress_image(
             kept = False
 
     if kept:
-        fmtmap = {"JPEG": "image/jpeg", "JPG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
-        mime = fmtmap.get((img.format or "JPEG").upper(), "image/jpeg")
+        mime = ("image/" + (img.format or "jpeg").lower()).replace("image/jpeg", "image/jpeg")
+        if img.format == "JPG":
+            mime = "image/jpeg"
     else:
-        mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
+        mime = "image/jpeg"
 
     return Response(
         content=out_bytes,
         media_type=mime,
-        headers=hdr(len(data), out_bytes, kept),
+        headers=hdr(len(data), out_bytes, kept, {"X-Resized": "1" if did_resize else "0"}),
     )
 
 
 # ---------------- Image: convert ----------------
 
 @app.post("/image/convert")
-async def convert_image(
-    file: UploadFile = File(...),
-    format: str = Form("jpg"),
-    quality: int = Form(90),
-    max_dim: int = Form(0),
-):
+async def convert_image(file: UploadFile = File(...), format: str = Form("jpg")):
     data = await file.read()
     check_file(file, data)
     fmt = (format or "jpg").lower()
@@ -230,14 +240,7 @@ async def convert_image(
         raise HTTPException(400, "supported formats: jpg, png, webp")
 
     img = load_image(data)
-
-    if max_dim and max_dim > 0:
-        w, h = img.size
-        if max(w, h) > max_dim:
-            scale = max_dim / float(max(w, h))
-            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
-
-    out_bytes = save_image(img, fmt, quality if 1 <= quality <= 100 else 90)
+    out_bytes = save_image(img, fmt, 90)
     mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
     return Response(
         content=out_bytes,
@@ -290,7 +293,7 @@ async def resize_image(
 @app.post("/pdf/merge")
 async def merge_pdfs(files: list[UploadFile] = File(...)):
     if not files:
-        raise HTTPException(400, "no files")
+        raise HTTPException(400, "no files provided")
     if len(files) > MAX_FILES:
         raise HTTPException(400, "too many files (max 20)")
 
@@ -383,7 +386,7 @@ async def images_to_pdf(
     fit: str = Form("contain"),
 ):
     if not files:
-        raise HTTPException(400, "no files")
+        raise HTTPException(400, "no files provided")
     if len(files) > MAX_FILES:
         raise HTTPException(400, "too many files (max 20)")
 
