@@ -150,33 +150,49 @@ async def compress_image(
     file: UploadFile = File(...),
     level: str = Form("medium"),
     target_kb: int = Form(0),
+    quality: int = Form(0),
+    max_dim: int = Form(0),
+    format: str = Form("jpg"),
 ):
     data = await file.read()
     check_file(file, data)
     img = load_image(data)
 
+    if max_dim and max_dim > 0:
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+
+    fmt = (format or "jpg").lower()
+    if fmt == "jpeg":
+        fmt = "jpg"
+    if fmt not in ("jpg", "png", "webp"):
+        fmt = "jpg"
+
+    q = quality if 1 <= quality <= 100 else IMG_QUALITY.get(level, IMG_QUALITY["medium"])
+
     if target_kb and target_kb > 0:
-        # binary-search JPEG quality to hit the target size
+        # binary-search encoder quality to hit the target size
         target = target_kb * 1024
         best = None
         lo, hi = 5, 95
         for _ in range(7):
             mid = (lo + hi) // 2
-            out = save_image(img, "jpg", mid)
+            out = save_image(img, fmt, mid)
             if len(out) <= target:
                 best = out
                 lo = mid + 1
             else:
                 hi = mid - 1
         if best is None:
-            best = save_image(img, "jpg", 5)
+            best = save_image(img, fmt, 5)
         out_bytes = best
         kept = len(out_bytes) >= len(data)
         if kept:
             out_bytes = data
     else:
-        q = IMG_QUALITY.get(level, IMG_QUALITY["medium"])
-        out_bytes = save_image(img, "jpg", q)
+        out_bytes = save_image(img, fmt, q)
         if len(out_bytes) >= len(data):
             out_bytes = data
             kept = True
@@ -184,11 +200,10 @@ async def compress_image(
             kept = False
 
     if kept:
-        mime = ("image/" + (img.format or "jpeg").lower()).replace("image/jpeg", "image/jpeg")
-        if img.format == "JPG":
-            mime = "image/jpeg"
+        fmtmap = {"JPEG": "image/jpeg", "JPG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+        mime = fmtmap.get((img.format or "JPEG").upper(), "image/jpeg")
     else:
-        mime = "image/jpeg"
+        mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
 
     return Response(
         content=out_bytes,
@@ -200,7 +215,12 @@ async def compress_image(
 # ---------------- Image: convert ----------------
 
 @app.post("/image/convert")
-async def convert_image(file: UploadFile = File(...), format: str = Form("jpg")):
+async def convert_image(
+    file: UploadFile = File(...),
+    format: str = Form("jpg"),
+    quality: int = Form(90),
+    max_dim: int = Form(0),
+):
     data = await file.read()
     check_file(file, data)
     fmt = (format or "jpg").lower()
@@ -210,7 +230,14 @@ async def convert_image(file: UploadFile = File(...), format: str = Form("jpg"))
         raise HTTPException(400, "supported formats: jpg, png, webp")
 
     img = load_image(data)
-    out_bytes = save_image(img, fmt, 90)
+
+    if max_dim and max_dim > 0:
+        w, h = img.size
+        if max(w, h) > max_dim:
+            scale = max_dim / float(max(w, h))
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+
+    out_bytes = save_image(img, fmt, quality if 1 <= quality <= 100 else 90)
     mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
     return Response(
         content=out_bytes,
