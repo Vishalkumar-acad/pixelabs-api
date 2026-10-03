@@ -51,7 +51,7 @@ cd "$APP_DIR"
 docker build -t pixelabs-api .
 docker rm -f api >/dev/null 2>&1 || true
 docker run -d --name api --restart=always \
-  -p 127.0.0.1:10000:10000 -e PORT=10000 pixelabs-api >/dev/null
+  -p 127.0.0.1:10000:10000 -e PORT=10000 -e GIT_SHA="$REMOTE" pixelabs-api >/dev/null
 docker image prune -f >/dev/null
 
 for _ in $(seq 1 15); do

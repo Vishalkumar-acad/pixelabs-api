@@ -78,6 +78,9 @@ def health():
     return {
         "ok": True,
         "service": "pixelabs-tools",
+        # The commit this container was built from — the deploy script passes it
+        # in, so "which version is live?" is answerable from outside in one call.
+        "commit": os.environ.get("GIT_SHA", "unknown"),
         # Seconds since this container started — a fresh (small) number means a
         # deploy just happened; a huge one means it has been running for ages.
         "uptime_s": int(time.time() - STARTED_AT),
