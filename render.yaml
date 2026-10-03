@@ -1,6 +1,0 @@
-services:
-  - type: web
-    name: pixelabs-api
-    runtime: docker
-    plan: free
-    healthCheckPath: /health
