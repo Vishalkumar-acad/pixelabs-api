@@ -20,6 +20,7 @@ except Exception:
 from pypdf import PdfReader, PdfWriter
 
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
+MAX_TOTAL_BYTES = 150 * 1024 * 1024  # per request, across all files
 MAX_FILES = 20
 GS_BIN = os.environ.get("GS_BIN", "gs")
 TIMEOUT_SECS = 120
@@ -46,6 +47,14 @@ def check_file(upload: UploadFile, data: bytes):
     if len(data) > MAX_BYTES:
         raise HTTPException(413, "file too large (max 50 MB)")
 
+
+def check_total(total: int):
+    """Guard the whole request, not just each file: 20 x 50 MB would not
+    fit in this box's memory, and an OOM kill takes the API down for
+    everyone. Reject early, with a clear message, instead."""
+    if total > MAX_TOTAL_BYTES:
+        raise HTTPException(413, "too much data in one request (max 150 MB in total)")
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "pixelabs-tools", "heic": HEIC_OK, "docs": "/docs"}
@@ -53,7 +62,22 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    """Liveness plus a look at the binaries the cloud tools need.
+
+    Stays 200 while the process is serving (the uptime monitor and the
+    deploy workflow depend on that), but names every dependency so a
+    broken image is visible without opening a shell."""
+    deps = {
+        "ghostscript": bool(shutil.which(GS_BIN)),
+        "ffmpeg": bool(shutil.which(FFMPEG)),
+        "heic": HEIC_OK,
+    }
+    return {
+        "ok": True,
+        "service": "pixelabs-tools",
+        "deps": deps,
+        "degraded": not all(deps.values()),
+    }
 
 
 def hdr(orig_len: int, out: bytes, kept: bool, extra=None):
@@ -299,9 +323,12 @@ async def merge_pdfs(files: list[UploadFile] = File(...)):
         raise HTTPException(400, "too many files (max 20)")
 
     datas = []
+    total = 0
     for f in files:
         d = await f.read()
         check_file(f, d)
+        total += len(d)
+        check_total(total)
         datas.append(d)
 
     writer = PdfWriter()
@@ -392,10 +419,13 @@ async def images_to_pdf(
         raise HTTPException(400, "too many files (max 20)")
 
     writer = PdfWriter()
+    total = 0
 
     for f in files:
         d = await f.read()
         check_file(f, d)
+        total += len(d)
+        check_total(total)
         img = load_image(d)
         if img.mode != "RGB":
             img = img.convert("RGB")
@@ -579,6 +609,7 @@ async def audio_join(
             d = await f.read()
             check_file(f, d)
             total_in += len(d)
+            check_total(total_in)
             ext = _ext(f.filename, AUDIO_EXT)
             src = os.path.join(tmpdir, f"in{i}{ext}")
             with open(src, "wb") as fh:
