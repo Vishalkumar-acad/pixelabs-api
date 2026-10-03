@@ -1,10 +1,13 @@
-name: Deploy API to Azure VM
+name: Deploy API to Azure VM (manual — needs IPv6)
 
-# Auto-deploy the processing API to the Azure VM behind api.pixelabs.in.
+# ⚠️ NOT the normal deploy path any more.
 #
-# On every push to main this pulls the new code on the VM, rebuilds the
-# Docker image and restarts the container. The container runs with
-# --restart=always, so it also comes back by itself after a VM reboot.
+# The VM's public address is IPv6-only (Azure charges for public IPv4), and
+# GitHub-hosted runners have no IPv6 egress, so this SSH job cannot reach the
+# VM — run #5 proved it. Pushes to main are deployed by the VM itself instead:
+# /usr/local/bin/pixelabs-deploy on a systemd timer (see scripts/pull-deploy.sh
+# and the README). This workflow is kept for the day the VM gets a public IPv4
+# again, or for running from a self-hosted runner / a machine with IPv6.
 #
 # Required repository secrets
 # (GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret):
@@ -16,8 +19,6 @@ name: Deploy API to Azure VM
 #                    (-----BEGIN ... PRIVATE KEY----- ... -----END ... PRIVATE KEY-----)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
 # Never let two deploys overlap.

@@ -33,12 +33,52 @@ visitor
 - The VM has 2 GB of swap (`/swapfile`, persisted in `/etc/fstab`) so a burst of
   big jobs cannot OOM-kill the API.
 
-## Deploy
+## Deploy (pull-based — the VM fetches, nothing connects in)
 
-Every push to `main` runs `.github/workflows/deploy.yml`: it SSHes into the VM
-(repository secrets `VM_HOST`, `VM_USER`, `SSH_PRIVATE_KEY`), pulls this repo,
-rebuilds the image, restarts the container with `--restart=always`, and reports
-success only once `/health` answers on `127.0.0.1:10000`.
+The VM's public address is IPv6-only, and GitHub-hosted runners have no IPv6
+egress, so a CI job cannot SSH into it (`.github/workflows/deploy.yml` is kept
+for manual use only). Instead the VM deploys itself:
+
+- `scripts/pull-deploy.sh`, installed at `/usr/local/bin/pixelabs-deploy`, fetches
+  `main`, compares commits, and only when `main` has actually moved it rebuilds
+  the image, restarts the container (`--restart=always`) and waits for
+  `/health` on `127.0.0.1:10000` before reporting success.
+- `pixelabs-deploy.timer` runs it every few minutes, so a push is live within
+  ~3 minutes.
+- Because nothing connects *in*, the SSH port can stay closed entirely.
+
+Install it once on the VM (as root):
+
+```sh
+sudo install -m 755 scripts/pull-deploy.sh /usr/local/bin/pixelabs-deploy
+sudo tee /etc/systemd/system/pixelabs-deploy.service >/dev/null <<'EOF'
+[Unit]
+Description=PixelAbs API pull-deploy (rebuild when main changes)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pixelabs-deploy
+EOF
+sudo tee /etc/systemd/system/pixelabs-deploy.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run the PixelAbs pull-deploy every 3 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now pixelabs-deploy.timer
+sudo systemctl start pixelabs-deploy.service     # first run now
+systemctl list-timers pixelabs-deploy.timer      # check it is scheduled
+journalctl -u pixelabs-deploy -n 20              # see what it did
+```
 
 ## Endpoints
 
