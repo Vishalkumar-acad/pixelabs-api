@@ -9,6 +9,7 @@ import zipfile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 
 try:  # HEIC support (iPhone photos) — optional
@@ -25,6 +26,10 @@ STARTED_AT = time.time()  # lets /health show how long this build has been up
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
 MAX_TOTAL_BYTES = 150 * 1024 * 1024  # per request, across all files
 MAX_FILES = 20
+# PDFs are streamed to disk and back, never held in memory, so /compress can
+# take a bigger file than the in-memory image/audio routes. Kept under
+# Cloudflare's 100 MB request-body cap.
+MAX_PDF_BYTES = 90 * 1024 * 1024  # 90 MB, PDF compression only
 GS_BIN = os.environ.get("GS_BIN", "gs")
 TIMEOUT_SECS = 120
 
@@ -89,10 +94,11 @@ def health():
     }
 
 
-def hdr(orig_len: int, out: bytes, kept: bool, extra=None):
+def hdr(orig_len: int, out, kept: bool, extra=None):
+    rlen = out if isinstance(out, int) else len(out)
     h = {
         "X-Original-Size": str(orig_len),
-        "X-Result-Size": str(len(out)),
+        "X-Result-Size": str(rlen),
         "X-Kept": "1" if kept else "0",
         "Cache-Control": "no-store",
     }
@@ -104,16 +110,28 @@ def hdr(orig_len: int, out: bytes, kept: bool, extra=None):
 
 @app.post("/compress")
 async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")):
-    data = await file.read()
-    check_file(file, data)
+    """Ghostscript. Unlike the image/audio routes this one never holds the
+    upload in memory: the file is streamed to disk, compressed there, and
+    streamed back — so a PDF may be much larger than the in-memory limit
+    (MAX_BYTES) allows. See MAX_PDF_BYTES."""
+    size = file.size or 0
+    if size == 0:
+        raise HTTPException(400, "empty file")
+    if size > MAX_PDF_BYTES:
+        raise HTTPException(413, "file too large (max 90 MB)")
     lvl = PDF_LEVELS.get(level, PDF_LEVELS["medium"])
 
     tmpdir = tempfile.mkdtemp(prefix="pat_")
     src = os.path.join(tmpdir, "in.pdf")
     out = os.path.join(tmpdir, "out.pdf")
     try:
+        # stream the upload to disk in chunks — never file.read() the whole PDF
         with open(src, "wb") as f:
-            f.write(data)
+            shutil.copyfileobj(file.file, f, 1024 * 1024)
+        in_len = os.path.getsize(src)
+        if in_len > MAX_PDF_BYTES:
+            raise HTTPException(413, "file too large (max 90 MB)")
+
         kept = True
         try:
             rc = subprocess.run(
@@ -127,20 +145,31 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
                 timeout=TIMEOUT_SECS,
                 capture_output=True,
             )
-            if rc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) < len(data):
+            if rc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) < in_len:
                 kept = False
         except (subprocess.TimeoutExpired, FileNotFoundError):
             kept = True
 
-        with open(src if kept else out, "rb") as f:
-            out_bytes = f.read()
-        return Response(
-            content=out_bytes,
-            media_type="application/pdf",
-            headers=hdr(len(data), out_bytes, kept),
-        )
-    finally:
+        result = src if kept else out
+        headers = hdr(in_len, os.path.getsize(result), kept)
+    except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    def stream_and_clean():
+        try:
+            with open(result, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return StreamingResponse(
+        stream_and_clean(), media_type="application/pdf", headers=headers
+    )
 
 # ---------------- Image helpers ----------------
 

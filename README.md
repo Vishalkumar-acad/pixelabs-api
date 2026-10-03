@@ -116,6 +116,8 @@ journalctl -u pixelabs-deploy -n 20              # see what it did
 - `POST /video/gif` — video to GIF (ffmpeg).
 
 Limits: 50 MB per file, 20 files per request, **150 MB in total per request**.
+`/compress` (PDF) is the exception: it streams the upload to disk and the result
+back, never holding the file in memory, so it accepts up to **90 MB** per PDF.
 Files are processed in memory or in temporary directories that are deleted
 immediately — nothing is stored or logged.
 
