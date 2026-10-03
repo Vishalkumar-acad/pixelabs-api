@@ -89,7 +89,9 @@ journalctl -u pixelabs-deploy -n 20              # see what it did
 ## Endpoints
 
 - `GET /health` — liveness. Also reports the binaries the cloud tools need
-  (`deps`: ghostscript, ffmpeg, heic) plus a `degraded` flag.
+  (`deps`: ghostscript, ffmpeg, heic) plus a `degraded` flag, and `uptime_s`
+  (seconds since this container started) — a small number right after a deploy
+  is how you confirm from outside that the pull-deploy actually restarted it.
 - `POST /compress` — PDF compression (Ghostscript). Form: `file`, `level`
   (`high`/`medium`/`low`). Headers: `X-Original-Size`, `X-Result-Size`, `X-Kept`.
 - `POST /image/compress` — image compression. Form: `file`, `level`, optional
