@@ -37,6 +37,19 @@ if [ ! -d "$APP_DIR/.git" ]; then
 fi
 
 as_user fetch --prune origin "$BRANCH" --quiet
+
+# Self-update, FIRST, so every decision below uses the newest logic. The
+# installed copy is a snapshot, so pull just this one file out of the ref we
+# just fetched and, if it differs from the running copy, install it and start
+# over with the new logic.
+SELF_SRC="$APP_DIR/scripts/pull-deploy.sh"
+as_user checkout "origin/$BRANCH" -- scripts/pull-deploy.sh 2>/dev/null || true
+if [ -f "$SELF_SRC" ] && ! cmp -s "$SELF_SRC" "$0"; then
+  log "deploy script changed — installing the new one and re-running"
+  install -m 755 "$SELF_SRC" "$0"
+  exec "$0"
+fi
+
 REMOTE="$(as_user rev-parse "origin/$BRANCH")"
 DEPLOYED="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
 
