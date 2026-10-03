@@ -47,7 +47,13 @@ for manual use only). Instead the VM deploys itself:
   ~3 minutes.
 - Because nothing connects *in*, the SSH port can stay closed entirely.
 
-Install it once on the VM (as root):
+Install it once on the VM — one line, as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Vishalkumar-acad/pixelabs-api/main/scripts/install-pull-deploy.sh | sudo bash
+```
+
+(or, to do it by hand:)
 
 ```sh
 sudo install -m 755 scripts/pull-deploy.sh /usr/local/bin/pixelabs-deploy
