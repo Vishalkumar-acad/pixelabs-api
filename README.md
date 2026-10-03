@@ -25,6 +25,11 @@ visitor
   container IP: Docker assigns a new IP every time the container is recreated,
   which happens on every deploy (a hardcoded `172.17.x.x` gives 502s).
 - `portainer.pixelabs.in` sits behind Cloudflare Access (Zero Trust, admin-only).
+- The VM's **public** address is IPv6 (Azure charges for public IPv4 addresses, so the
+  public IPv4 was dropped and IPv4 is used privately only). Cloudflare reaches the
+  origin over IPv6, so `api.pixelabs.in` is unaffected — but anything that needs to
+  open an inbound connection to the VM (SSH from CI, for example) must be able to
+  speak IPv6.
 - The VM has 2 GB of swap (`/swapfile`, persisted in `/etc/fstab`) so a burst of
   big jobs cannot OOM-kill the API.
 
