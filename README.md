@@ -49,6 +49,10 @@ for manual use only). Instead the VM deploys itself:
   the new code was live while the old container kept running.
 - `pixelabs-deploy.timer` runs it every few minutes, so a push is live within
   ~3 minutes.
+- The installed script keeps itself current: it pulls `scripts/pull-deploy.sh`
+  out of the ref it just fetched and, if that differs from the copy it is
+  running, installs it and re-execs — so a fix to the deploy script reaches the
+  VM without re-running the installer.
 - Because nothing connects *in*, the SSH port can stay closed entirely.
 
 Install it once on the VM — one line, as root:
@@ -93,9 +97,10 @@ journalctl -u pixelabs-deploy -n 20              # see what it did
 ## Endpoints
 
 - `GET /health` — liveness. Also reports the binaries the cloud tools need
-  (`deps`: ghostscript, ffmpeg, heic) plus a `degraded` flag, and `uptime_s`
-  (seconds since this container started) — a small number right after a deploy
-  is how you confirm from outside that the pull-deploy actually restarted it.
+  (`deps`: ghostscript, ffmpeg, heic) plus a `degraded` flag, `uptime_s`
+  (seconds since this container started) and `commit` (the SHA the running
+  container was built from). Between them you can confirm from outside that a
+  deploy landed: `commit` should be the new SHA and `uptime_s` should be small.
 - `POST /compress` — PDF compression (Ghostscript). Form: `file`, `level`
   (`high`/`medium`/`low`). Headers: `X-Original-Size`, `X-Result-Size`, `X-Kept`.
 - `POST /image/compress` — image compression. Form: `file`, `level`, optional
