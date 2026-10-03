@@ -52,12 +52,16 @@ jobs:
             # so a hard reset to origin/main is intentional).
             sudo docker build -t pixelabs-api .
             sudo docker rm -f api || true
-            sudo docker run -d --name api --restart=always -p 80:10000 -e PORT=10000 pixelabs-api
+            # Caddy owns the public ports (80/443) on this VM, so the container is
+            # published on the loopback interface only. The Caddyfile upstream
+            # should point at localhost:10000 (not a hardcoded container IP —
+            # Docker hands out a new one every time the container is recreated).
+            sudo docker run -d --name api --restart=always -p 127.0.0.1:10000:10000 -e PORT=10000 pixelabs-api
             sudo docker image prune -f
 
             # Wait for the new container to answer before declaring success.
             for i in $(seq 1 10); do
-              if curl -fsS http://127.0.0.1/health; then
+              if curl -fsS http://127.0.0.1:10000/health; then
                 echo
                 echo "Deploy OK — /health is answering."
                 exit 0
