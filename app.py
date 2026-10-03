@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Response
@@ -18,6 +19,8 @@ except Exception:
     HEIC_OK = False
 
 from pypdf import PdfReader, PdfWriter
+
+STARTED_AT = time.time()  # lets /health show how long this build has been up
 
 MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
 MAX_TOTAL_BYTES = 150 * 1024 * 1024  # per request, across all files
@@ -75,6 +78,9 @@ def health():
     return {
         "ok": True,
         "service": "pixelabs-tools",
+        # Seconds since this container started — a fresh (small) number means a
+        # deploy just happened; a huge one means it has been running for ages.
+        "uptime_s": int(time.time() - STARTED_AT),
         "deps": deps,
         "degraded": not all(deps.values()),
     }
