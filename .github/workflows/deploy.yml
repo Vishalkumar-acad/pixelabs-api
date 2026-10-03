@@ -1,0 +1,70 @@
+name: Deploy API to Azure VM
+
+# Auto-deploy the processing API to the Azure VM behind api.pixelabs.in.
+#
+# On every push to main this pulls the new code on the VM, rebuilds the
+# Docker image and restarts the container. The container runs with
+# --restart=always, so it also comes back by itself after a VM reboot.
+#
+# Required repository secrets
+# (GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret):
+#   VM_HOST          Public IP of the Azure VM (use the IP, NOT the
+#                    Cloudflare-proxied hostname — SSH cannot go through the proxy)
+#   VM_USER          azureuser
+#   SSH_PRIVATE_KEY  The complete contents of the private key file you
+#                    downloaded when the VM was created
+#                    (-----BEGIN ... PRIVATE KEY----- ... -----END ... PRIVATE KEY-----)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Never let two deploys overlap.
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild and restart the container on the VM
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+
+            APP_DIR="$HOME/pixelabs-api"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone https://github.com/Vishalkumar-acad/pixelabs-api.git "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+            git fetch --prune origin
+            git reset --hard origin/main
+
+            # Rebuild and swap the container (the VM is a deploy target only,
+            # so a hard reset to origin/main is intentional).
+            sudo docker build -t pixelabs-api .
+            sudo docker rm -f api || true
+            sudo docker run -d --name api --restart=always -p 80:10000 -e PORT=10000 pixelabs-api
+            sudo docker image prune -f
+
+            # Wait for the new container to answer before declaring success.
+            for i in $(seq 1 10); do
+              if curl -fsS http://127.0.0.1/health; then
+                echo
+                echo "Deploy OK — /health is answering."
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Health check failed — last 40 log lines:"
+            sudo docker logs --tail 40 api || true
+            exit 1
