@@ -40,9 +40,13 @@ egress, so a CI job cannot SSH into it (`.github/workflows/deploy.yml` is kept
 for manual use only). Instead the VM deploys itself:
 
 - `scripts/pull-deploy.sh`, installed at `/usr/local/bin/pixelabs-deploy`, fetches
-  `main`, compares commits, and only when `main` has actually moved it rebuilds
-  the image, restarts the container (`--restart=always`) and waits for
-  `/health` on `127.0.0.1:10000` before reporting success.
+  `main`, and only when there is something new to run does it rebuild the image,
+  restart the container (`--restart=always`) and wait for `/health` on
+  `127.0.0.1:10000` before reporting success.
+- "Already deployed" is tracked in `/var/lib/pixelabs-deploy/deployed` (the SHA
+  recorded after a *successful* deploy) — **not** the working tree's HEAD. A
+  manual `git pull` on the box used to advance HEAD and make the script believe
+  the new code was live while the old container kept running.
 - `pixelabs-deploy.timer` runs it every few minutes, so a push is live within
   ~3 minutes.
 - Because nothing connects *in*, the SSH port can stay closed entirely.
