@@ -1,3 +1,4 @@
+import asyncio
 import io
 import re
 import os
@@ -30,6 +31,10 @@ MAX_FILES = 20
 # take a bigger file than the in-memory image/audio routes. Kept under
 # Cloudflare's 100 MB request-body cap.
 MAX_PDF_BYTES = 90 * 1024 * 1024  # 90 MB, PDF compression only
+# This box has ~0.9 GiB of RAM. Two Ghostscript runs at once could OOM-kill
+# the container — and with it the whole API — so PDF compression is
+# serialized: one at a time, everyone else waits.
+PDF_SEM = asyncio.Semaphore(1)
 GS_BIN = os.environ.get("GS_BIN", "gs")
 TIMEOUT_SECS = 120
 
@@ -134,17 +139,21 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
 
         kept = True
         try:
-            rc = subprocess.run(
-                [
-                    GS_BIN, "-sDEVICE=pdfwrite",
-                    "-dCompatibilityLevel=1.4",
-                    "-dPDFSETTINGS=" + lvl,
-                    "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                    "-sOutputFile=" + out, src,
-                ],
-                timeout=TIMEOUT_SECS,
-                capture_output=True,
-            )
+            # Off the event loop (so /health keeps answering while gs works)
+            # and one at a time (see PDF_SEM).
+            async with PDF_SEM:
+                rc = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        GS_BIN, "-sDEVICE=pdfwrite",
+                        "-dCompatibilityLevel=1.4",
+                        "-dPDFSETTINGS=" + lvl,
+                        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                        "-sOutputFile=" + out, src,
+                    ],
+                    timeout=TIMEOUT_SECS,
+                    capture_output=True,
+                )
             if rc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) < in_len:
                 kept = False
         except (subprocess.TimeoutExpired, FileNotFoundError):
