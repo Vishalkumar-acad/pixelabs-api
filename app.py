@@ -525,6 +525,129 @@ async def images_to_pdf(
         headers=hdr(0, out_bytes, False, {"X-Page-Count": str(len(writer.pages))}),
     )
 
+# ---------------- PDF: pages to images ----------------
+
+RENDER_DPI = {"high": 200, "medium": 150, "low": 100}
+RENDER_QUALITY = {"high": 90, "medium": 80, "low": 65}
+MAX_RENDER_PAGES = 300
+
+
+def base_name(name: str) -> str:
+    stem = os.path.splitext(os.path.basename(name or "document"))[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "document"
+    return stem[:60]
+
+
+@app.post("/pdf/to-images", dependencies=[Depends(heavy_slot)])
+async def pdf_to_images(
+    file: UploadFile = File(...),
+    format: str = Form("jpg"),
+    level: str = Form("medium"),
+    pages: str = Form("all"),
+):
+    """Ghostscript renders each page to a JPEG/PNG and the images come back as
+    a ZIP. Both the upload and the ZIP go via disk, so this stays well under
+    the memory the in-memory image routes need."""
+    size = file.size or 0
+    if size == 0:
+        raise HTTPException(400, "empty file")
+    if size > MAX_PDF_BYTES:
+        raise HTTPException(413, "file too large (max 90 MB)")
+
+    fmt = "png" if (format or "").lower() == "png" else "jpg"
+    ext = fmt
+    dpi = RENDER_DPI.get(level, RENDER_DPI["medium"])
+    quality = RENDER_QUALITY.get(level, RENDER_QUALITY["medium"])
+
+    tmpdir = tempfile.mkdtemp(prefix="pat_")
+    src = os.path.join(tmpdir, "in.pdf")
+    try:
+        with open(src, "wb") as f:
+            shutil.copyfileobj(file.file, f, 1024 * 1024)
+        in_len = os.path.getsize(src)
+        if in_len > MAX_PDF_BYTES:
+            raise HTTPException(413, "file too large (max 90 MB)")
+
+        try:
+            reader = PdfReader(src)
+            total_pages = len(reader.pages)
+        except Exception:
+            raise HTTPException(400, "invalid PDF")
+
+        spec = (pages or "all").strip().lower()
+        wanted = None
+        if spec in ("", "all"):
+            if total_pages > MAX_RENDER_PAGES:
+                raise HTTPException(
+                    413, "too many pages (max %d)" % MAX_RENDER_PAGES
+                )
+        else:
+            wanted = list(dict.fromkeys(parse_pages(spec, total_pages)))
+            if not wanted:
+                raise HTTPException(400, "no pages selected")
+            writer = PdfWriter()
+            for i in wanted:
+                writer.add_page(reader.pages[i])
+            sub = os.path.join(tmpdir, "sel.pdf")
+            with open(sub, "wb") as f:
+                writer.write(f)
+            src = sub
+
+        device = "png16m" if fmt == "png" else "jpeg"
+        out_pat = os.path.join(tmpdir, "p-%04d." + ext)
+        args = [
+            GS_BIN, "-dNOPAUSE", "-dBATCH", "-dQUIET",
+            "-sDEVICE=" + device, "-r" + str(dpi),
+        ]
+        if device == "jpeg":
+            args.append("-dJPEGQ=" + str(quality))
+        args += ["-sOutputFile=" + out_pat, src]
+        await asyncio.to_thread(
+            subprocess.run, args, timeout=TIMEOUT_SECS, capture_output=True
+        )
+
+        rendered = sorted(
+            os.path.join(tmpdir, n)
+            for n in os.listdir(tmpdir)
+            if n.startswith("p-") and n.endswith("." + ext)
+        )
+        if not rendered:
+            raise HTTPException(
+                422, "could not render any pages — is this a valid, unlocked PDF?"
+            )
+
+        base = base_name(file.filename)
+        zip_path = os.path.join(tmpdir, "images.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, path in enumerate(rendered):
+                label = (wanted[n] + 1) if wanted else (n + 1)
+                z.write(path, "%s-page-%03d.%s" % (base, label, ext))
+        out_size = os.path.getsize(zip_path)
+        headers = {
+            "X-Page-Count": str(len(rendered)),
+            "X-Result-Size": str(out_size),
+            "Cache-Control": "no-store",
+        }
+    except BaseException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    def stream_and_clean():
+        try:
+            with open(zip_path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return StreamingResponse(
+        stream_and_clean(), media_type="application/zip", headers=headers
+    )
+
+
 # ---------------- Media: audio & video (ffmpeg) ----------------
 
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")

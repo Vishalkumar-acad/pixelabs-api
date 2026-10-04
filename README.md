@@ -112,6 +112,10 @@ journalctl -u pixelabs-deploy -n 20              # see what it did
 - `POST /pdf/split` — form: `file`, `pages` (`all` or `1-3,5`).
 - `POST /pdf/from-images` — form: multiple `files`, `page_size`
   (`a4`/`letter`/`fit`), `fit` (`contain`/`cover`).
+- `POST /pdf/to-images` — form: `file`, `format` (`jpg`/`png`), `level`,
+  `pages` (`all` or `1-3,5`). Renders each page with Ghostscript and returns a
+  ZIP of images; the upload and the ZIP both go via disk, so it never holds a
+  big PDF in memory.
 - `POST /audio/trim`, `POST /audio/speed`, `POST /audio/join` — ffmpeg (MP3).
 - `POST /video/gif` — video to GIF (ffmpeg).
 
