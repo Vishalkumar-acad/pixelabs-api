@@ -8,7 +8,7 @@ import tempfile
 import time
 import zipfile
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Response
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
@@ -31,10 +31,21 @@ MAX_FILES = 20
 # take a bigger file than the in-memory image/audio routes. Kept under
 # Cloudflare's 100 MB request-body cap.
 MAX_PDF_BYTES = 90 * 1024 * 1024  # 90 MB, PDF compression only
-# This box has ~0.9 GiB of RAM. Two Ghostscript runs at once could OOM-kill
-# the container — and with it the whole API — so PDF compression is
-# serialized: one at a time, everyone else waits.
-PDF_SEM = asyncio.Semaphore(1)
+
+# This box has ~0.9 GiB of RAM. A PDF through Ghostscript, a large image
+# through PIL, or an ffmpeg run can each take a sizeable bite of it, and two
+# at once is how you get an OOM kill — which takes the API down for everyone.
+# So every memory-hungry route holds this one slot: heavy jobs run one at a
+# time. Light routes (/health, /) never touch it, so they always answer, no
+# matter how busy the box is.
+HEAVY = asyncio.Semaphore(1)
+
+
+async def heavy_slot():
+    """Dependency: hold the single heavy-work slot for the whole request."""
+    async with HEAVY:
+        yield
+
 GS_BIN = os.environ.get("GS_BIN", "gs")
 TIMEOUT_SECS = 120
 
@@ -113,7 +124,7 @@ def hdr(orig_len: int, out, kept: bool, extra=None):
 
 # ---------------- PDF: compress (Ghostscript) ----------------
 
-@app.post("/compress")
+@app.post("/compress", dependencies=[Depends(heavy_slot)])
 async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")):
     """Ghostscript. Unlike the image/audio routes this one never holds the
     upload in memory: the file is streamed to disk, compressed there, and
@@ -139,21 +150,21 @@ async def compress_pdf(file: UploadFile = File(...), level: str = Form("medium")
 
         kept = True
         try:
-            # Off the event loop (so /health keeps answering while gs works)
-            # and one at a time (see PDF_SEM).
-            async with PDF_SEM:
-                rc = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        GS_BIN, "-sDEVICE=pdfwrite",
-                        "-dCompatibilityLevel=1.4",
-                        "-dPDFSETTINGS=" + lvl,
-                        "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                        "-sOutputFile=" + out, src,
-                    ],
-                    timeout=TIMEOUT_SECS,
-                    capture_output=True,
-                )
+            # Off the event loop, so /health keeps answering while gs works.
+            # The heavy_slot dependency already guarantees this is the only
+            # heavy job running.
+            rc = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    GS_BIN, "-sDEVICE=pdfwrite",
+                    "-dCompatibilityLevel=1.4",
+                    "-dPDFSETTINGS=" + lvl,
+                    "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                    "-sOutputFile=" + out, src,
+                ],
+                timeout=TIMEOUT_SECS,
+                capture_output=True,
+            )
             if rc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) < in_len:
                 kept = False
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -217,7 +228,7 @@ def save_image(img: Image.Image, fmt: str, quality: int) -> bytes:
 
 # ---------------- Image: compress ----------------
 
-@app.post("/image/compress")
+@app.post("/image/compress", dependencies=[Depends(heavy_slot)])
 async def compress_image(
     file: UploadFile = File(...),
     level: str = Form("medium"),
@@ -225,7 +236,7 @@ async def compress_image(
 ):
     data = await file.read()
     check_file(file, data)
-    img = load_image(data)
+    img = await asyncio.to_thread(load_image, data)
     did_resize = False
 
     if target_kb and target_kb > 0:
@@ -241,12 +252,12 @@ async def compress_image(
         cur = img
         best = None
         while True:
-            if len(save_image(cur, "jpg", FLOOR)) <= target:
-                best = save_image(cur, "jpg", FLOOR)
+            if len(await asyncio.to_thread(save_image, cur, "jpg", FLOOR)) <= target:
+                best = await asyncio.to_thread(save_image, cur, "jpg", FLOOR)
                 lo, hi = FLOOR, 95
                 for _ in range(7):
                     mid = (lo + hi) // 2
-                    out = save_image(cur, "jpg", mid)
+                    out = await asyncio.to_thread(save_image, cur, "jpg", mid)
                     if len(out) <= target:
                         best = out
                         lo = mid + 1
@@ -257,28 +268,28 @@ async def compress_image(
                 break
             w = max(1, round(w * 0.85))
             h = max(1, round(h * 0.85))
-            cur = img.resize((w, h), Image.LANCZOS)
+            cur = await asyncio.to_thread(img.resize, (w, h), Image.LANCZOS)
             did_resize = True
         if best is None:
             # already at the readability limit — fall back to quality search
             lo, hi = 5, 95
             for _ in range(7):
                 mid = (lo + hi) // 2
-                out = save_image(cur, "jpg", mid)
+                out = await asyncio.to_thread(save_image, cur, "jpg", mid)
                 if len(out) <= target:
                     best = out
                     lo = mid + 1
                 else:
                     hi = mid - 1
             if best is None:
-                best = save_image(cur, "jpg", 5)
+                best = await asyncio.to_thread(save_image, cur, "jpg", 5)
         out_bytes = best
         kept = len(out_bytes) >= len(data)
         if kept:
             out_bytes = data
     else:
         q = IMG_QUALITY.get(level, IMG_QUALITY["medium"])
-        out_bytes = save_image(img, "jpg", q)
+        out_bytes = await asyncio.to_thread(save_image, img, "jpg", q)
         if len(out_bytes) >= len(data):
             out_bytes = data
             kept = True
@@ -301,7 +312,7 @@ async def compress_image(
 
 # ---------------- Image: convert ----------------
 
-@app.post("/image/convert")
+@app.post("/image/convert", dependencies=[Depends(heavy_slot)])
 async def convert_image(file: UploadFile = File(...), format: str = Form("jpg")):
     data = await file.read()
     check_file(file, data)
@@ -311,8 +322,8 @@ async def convert_image(file: UploadFile = File(...), format: str = Form("jpg"))
     if fmt not in ("jpg", "png", "webp"):
         raise HTTPException(400, "supported formats: jpg, png, webp")
 
-    img = load_image(data)
-    out_bytes = save_image(img, fmt, 90)
+    img = await asyncio.to_thread(load_image, data)
+    out_bytes = await asyncio.to_thread(save_image, img, fmt, 90)
     mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
     return Response(
         content=out_bytes,
@@ -323,7 +334,7 @@ async def convert_image(file: UploadFile = File(...), format: str = Form("jpg"))
 
 # ---------------- Image: resize ----------------
 
-@app.post("/image/resize")
+@app.post("/image/resize", dependencies=[Depends(heavy_slot)])
 async def resize_image(
     file: UploadFile = File(...),
     width: int = Form(0),
@@ -335,7 +346,7 @@ async def resize_image(
     if width <= 0 and height <= 0:
         raise HTTPException(400, "width or height required")
 
-    img = load_image(data)
+    img = await asyncio.to_thread(load_image, data)
     w, h = img.size
     if width > 0 and height > 0:
         nw, nh = width, height
@@ -346,12 +357,12 @@ async def resize_image(
         nh = height
         nw = max(1, round(w * height / h))
 
-    img = img.resize((nw, nh), Image.LANCZOS)
+    img = await asyncio.to_thread(img.resize, (nw, nh), Image.LANCZOS)
 
     fmt = (format or "").lower()
     if fmt not in ("jpg", "png", "webp"):
         fmt = "png" if img.mode in ("RGBA", "LA", "P") else "jpg"
-    out_bytes = save_image(img, fmt, 90)
+    out_bytes = await asyncio.to_thread(save_image, img, fmt, 90)
     mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
     return Response(
         content=out_bytes,
@@ -362,7 +373,7 @@ async def resize_image(
 
 # ---------------- PDF: merge ----------------
 
-@app.post("/pdf/merge")
+@app.post("/pdf/merge", dependencies=[Depends(heavy_slot)])
 async def merge_pdfs(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "no files provided")
@@ -422,7 +433,7 @@ def parse_pages(spec: str, total: int):
             idx.append(p - 1)
     return idx
 
-@app.post("/pdf/split")
+@app.post("/pdf/split", dependencies=[Depends(heavy_slot)])
 async def split_pdf(file: UploadFile = File(...), pages: str = Form("all")):
     data = await file.read()
     check_file(file, data)
@@ -454,7 +465,7 @@ async def split_pdf(file: UploadFile = File(...), pages: str = Form("all")):
 PAGE_SIZES = {"a4": (595, 842), "letter": (612, 792)}
 
 
-@app.post("/pdf/from-images")
+@app.post("/pdf/from-images", dependencies=[Depends(heavy_slot)])
 async def images_to_pdf(
     files: list[UploadFile] = File(...),
     page_size: str = Form("a4"),
@@ -473,7 +484,7 @@ async def images_to_pdf(
         check_file(f, d)
         total += len(d)
         check_total(total)
-        img = load_image(d)
+        img = await asyncio.to_thread(load_image, d)
         if img.mode != "RGB":
             img = img.convert("RGB")
 
@@ -489,7 +500,7 @@ async def images_to_pdf(
             else:  # contain
                 scale = min(pw / iw, ph / ih)
             nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
-            img = img.resize((nw, nh), Image.LANCZOS)
+            img = await asyncio.to_thread(img.resize, (nw, nh), Image.LANCZOS)
 
         # white page canvas, image centered
         canvas = Image.new("RGB", (pw, ph), (255, 255, 255))
@@ -529,9 +540,11 @@ def _ext(name: str, allowed: set) -> str:
     return e
 
 
-def run_ffmpeg(args, timeout=TIMEOUT_SECS):
+async def run_ffmpeg(args, timeout=TIMEOUT_SECS):
     try:
-        p = subprocess.run([FFMPEG] + args, capture_output=True, timeout=timeout)
+        p = await asyncio.to_thread(
+            subprocess.run, [FFMPEG] + args, capture_output=True, timeout=timeout
+        )
     except FileNotFoundError:
         raise HTTPException(503, "ffmpeg not installed")
     except subprocess.TimeoutExpired:
@@ -542,9 +555,11 @@ def run_ffmpeg(args, timeout=TIMEOUT_SECS):
     return p.stdout
 
 
-def probe_sample_rate(path: str) -> int:
+async def probe_sample_rate(path: str) -> int:
     try:
-        p = subprocess.run([FFMPEG, "-i", path], capture_output=True, timeout=30)
+        p = await asyncio.to_thread(
+            subprocess.run, [FFMPEG, "-i", path], capture_output=True, timeout=30
+        )
         text = p.stderr.decode("utf-8", "ignore")
         m = re.search(r"(\d{4,6}) Hz", text)
         return int(m.group(1)) if m else 44100
@@ -564,7 +579,7 @@ def mp3_response(out: bytes, orig_len: int, extra=None):
     return Response(content=out, media_type=MP3_MIME, headers=h)
 
 
-@app.post("/audio/trim")
+@app.post("/audio/trim", dependencies=[Depends(heavy_slot)])
 async def audio_trim(
     file: UploadFile = File(...),
     start: float = Form(0),
@@ -587,7 +602,7 @@ async def audio_trim(
         path = t.name
     try:
         if fmt == "wav":
-            out = run_ffmpeg([
+            out = await run_ffmpeg([
                 "-hide_banner", "-loglevel", "error",
                 "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
                 "-i", path, "-c:a", "pcm_s16le", "-f", "wav", "-",
@@ -596,7 +611,7 @@ async def audio_trim(
                 content=out, media_type="audio/wav",
                 headers={"X-Original-Size": str(len(data)), "X-Result-Size": str(len(out)),
                          "X-Kept": "0", "X-Format": "wav", "Cache-Control": "no-store"})
-        out = run_ffmpeg([
+        out = await run_ffmpeg([
             "-hide_banner", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
             "-i", path, "-c:a", "libmp3lame", "-b:a", "160k", "-f", "mp3", "-",
@@ -606,7 +621,7 @@ async def audio_trim(
         os.unlink(path)
 
 
-@app.post("/audio/speed")
+@app.post("/audio/speed", dependencies=[Depends(heavy_slot)])
 async def audio_speed(
     file: UploadFile = File(...),
     factor: float = Form(1.0),
@@ -624,9 +639,9 @@ async def audio_speed(
         t.write(data)
         path = t.name
     try:
-        sr = probe_sample_rate(path)
+        sr = await probe_sample_rate(path)
         # tape style: asetrate changes pitch+speed together (cassette player)
-        out = run_ffmpeg([
+        out = await run_ffmpeg([
             "-hide_banner", "-loglevel", "error",
             "-i", path,
             "-af", f"asetrate={int(sr * factor)},aresample={sr}",
@@ -637,7 +652,7 @@ async def audio_speed(
         os.unlink(path)
 
 
-@app.post("/audio/join")
+@app.post("/audio/join", dependencies=[Depends(heavy_slot)])
 async def audio_join(
     files: list[UploadFile] = File(...),
     gap: float = Form(0),
@@ -662,12 +677,12 @@ async def audio_join(
             with open(src, "wb") as fh:
                 fh.write(d)
             part = os.path.join(tmpdir, f"p{i}.wav")
-            run_ffmpeg(["-hide_banner", "-loglevel", "error", "-i", src,
+            await run_ffmpeg(["-hide_banner", "-loglevel", "error", "-i", src,
                         "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", part])
             parts.append(part)
             if gap > 0 and i < len(files) - 1:
                 sil = os.path.join(tmpdir, f"s{i}.wav")
-                run_ffmpeg(["-hide_banner", "-loglevel", "error",
+                await run_ffmpeg(["-hide_banner", "-loglevel", "error",
                             "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
                             "-t", f"{gap:.2f}", "-c:a", "pcm_s16le", sil])
                 parts.append(sil)
@@ -676,7 +691,7 @@ async def audio_join(
             for p in parts:
                 lf.write(f"file '{p}'\n")
 
-        out = run_ffmpeg([
+        out = await run_ffmpeg([
             "-hide_banner", "-loglevel", "error",
             "-f", "concat", "-safe", "0", "-i", os.path.join(tmpdir, "list.txt"),
             "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "-",
@@ -686,7 +701,7 @@ async def audio_join(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-@app.post("/video/gif")
+@app.post("/video/gif", dependencies=[Depends(heavy_slot)])
 async def video_gif(
     file: UploadFile = File(...),
     start: float = Form(0),
@@ -710,7 +725,7 @@ async def video_gif(
     try:
         vf = (f"fps={fps},scale={width}:-2:flags=lanczos,"
               "split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer")
-        out = run_ffmpeg([
+        out = await run_ffmpeg([
             "-hide_banner", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
             "-i", path,
